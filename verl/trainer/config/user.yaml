@@ -1,0 +1,66 @@
+defaults:
+  - _self_
+
+vars:
+  dir: /users/${oc.env:USER}/SDPO
+  task: ${oc.env:TASK}
+  log_dir: /users/${oc.env:USER}/output
+  ckpt_dir: /capstor/scratch/cscs/${oc.env:USER}/ttrl_runs/${vars.task}
+
+data:
+  train_files: ["${vars.dir}/${vars.task}/train.parquet"]
+  val_files: ["${vars.dir}/${vars.task}/test.parquet"]
+  filter_overlong_prompts: True
+  max_prompt_length: 2048
+  max_response_length: 8192
+  shuffle: True
+  trust_remote_code: True
+  apply_chat_template_kwargs: {"enable_thinking": false}
+
+actor_rollout_ref:
+  actor:
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: ${max_model_len}
+    clip_ratio_high: 0.28
+    use_kl_loss: False
+  model:
+    path: Qwen/Qwen3-8B
+    trust_remote_code: True
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    gpu_memory_utilization: 0.55
+    log_prob_micro_batch_size_per_gpu: 1
+    max_num_batched_tokens: ${max_model_len}
+    max_model_len: ${max_model_len}
+    val_kwargs:
+      top_p: 0.95
+      temperature: 0.6
+      n: 4
+      do_sample: True
+
+algorithm:
+  use_kl_in_reward: False
+
+custom_reward_function:
+  path: /users/${oc.env:USER}/SDPO/verl/utils/reward_score/feedback/__init__.py
+
+critic:
+  model:
+    path: Qwen/Qwen3-8B
+
+reward_model:
+  use_reward_loop: False # disables experimental reward manager (which gives lower scores)
+
+trainer:
+  project_name: SDPO-${oc.env:USER}
+  group_name: ${oc.env:EXPERIMENT}
+  experiment_name: ${oc.env:EXPERIMENT}
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 0
+  test_freq: 5
+  max_actor_ckpt_to_keep: 1
+  total_epochs: 30
+  default_local_dir: ${vars.ckpt_dir}/${trainer.experiment_name}  # experiment_name needs to be a unique identifier
