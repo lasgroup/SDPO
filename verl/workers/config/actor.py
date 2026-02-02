@@ -44,7 +44,8 @@ class SelfDistillationConfig(BaseConfig):
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
-        ema_update_rate (float): EMA update rate for teacher weights.
+        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
+        teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
@@ -64,7 +65,8 @@ class SelfDistillationConfig(BaseConfig):
     full_logit_distillation: bool = True
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
-    ema_update_rate: float = 0.05
+    teacher_regularization: str = "ema"
+    teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
@@ -92,8 +94,16 @@ class SelfDistillationConfig(BaseConfig):
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        if not 0.0 <= self.ema_update_rate <= 1.0:
-            raise ValueError(f"self_distillation.ema_update_rate must be in [0,1], got {self.ema_update_rate}")
+        valid_teacher_regularization = ["ema", "trust-region"]
+        if self.teacher_regularization not in valid_teacher_regularization:
+            raise ValueError(
+                "self_distillation.teacher_regularization must be one of "
+                f"{valid_teacher_regularization}, got {self.teacher_regularization}"
+            )
+        if not 0.0 <= self.teacher_update_rate <= 1.0:
+            raise ValueError(
+                f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}"
+            )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
                 f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"

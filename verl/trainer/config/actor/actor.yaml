@@ -98,8 +98,11 @@ self_distillation:
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5
 
-  # EMA update rate for teacher weights
-  ema_update_rate: 0.05 
+  # Teacher regularization method: "ema" or "trust-region"
+  teacher_regularization: ema
+
+  # EMA update rate for teacher weights, or trust-region mixing coefficient
+  teacher_update_rate: 0.05 
 
   # Maximum length of the reprompted prompt
   max_reprompt_len: 10240

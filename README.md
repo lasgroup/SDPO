@@ -262,7 +262,9 @@ Located at `actor.self_distillation` in the config. Only active when `actor.poli
 
 - **success_reward_threshold** (float, default: `1.0`): Minimum sequence reward to be considered a successful demonstration.
 
-- **ema_update_rate** (float, default: `0.05`): EMA update rate for teacher weights.
+- **teacher_regularization** (str, default: `"ema"`): Teacher regularization mode. Options: `ema`, `trust-region`. Note: if `ema` is used, the model on the `RefWorker` is updated as an exponential moving average. `trust-region` requires `use_fused_kernels = False`.
+
+- **teacher_update_rate** (float, default: `0.05`): EMA update rate for teacher weights, or trust-region mixing coefficient.
 
 - **distillation_topk** (int | None, default: `100`): If set, use top-k logits for distillation instead of full distribution.
 

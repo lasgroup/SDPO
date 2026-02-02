@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -45,6 +46,22 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class TrustRegionTeacher(nn.Module):
+    def __init__(self, ref_module: nn.Module, student_module: nn.Module, mix_coef: float) -> None:
+        super().__init__()
+        self.ref_module = ref_module
+        self.student_module = student_module
+        self.mix_coef = float(mix_coef)
+
+    def forward(self, *args, **kwargs):
+        ref_out = self.ref_module(*args, **kwargs)
+        student_out = self.student_module(*args, **kwargs)
+        ref_logits = ref_out.logits if hasattr(ref_out, "logits") else ref_out[0]
+        student_logits = student_out.logits if hasattr(student_out, "logits") else student_out[0]
+        logits = torch.lerp(ref_logits, student_logits, self.mix_coef)
+        return SimpleNamespace(logits=logits)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -112,13 +129,16 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
-    def _update_teacher_ema(self) -> None:
+    def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         if not self_distillation_cfg or loss_mode != "sdpo":
             return
-        ema_rate = getattr(self_distillation_cfg, "ema_update_rate", 0.0)
-        if ema_rate == 0.0:
+        teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
+        if teacher_regularization != "ema":
+            return
+        update_rate = getattr(self_distillation_cfg, "teacher_update_rate", 0.0)
+        if update_rate == 0.0:
             return
         if self.teacher_module is None or self.teacher_module is self.actor_module:
             raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
@@ -128,7 +148,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_module.parameters(),
             ):
                 student_data = student_param.data.to(device=teacher_param.device)
-                teacher_param.data.mul_(1.0 - ema_rate).add_(student_data, alpha=ema_rate)
+                teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
 
     @staticmethod
     def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
@@ -751,6 +771,9 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
+                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                    if teacher_regularization == "trust-region" and self.use_fused_kernels:
+                        raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
                     # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
@@ -790,6 +813,10 @@ class DataParallelPPOActor(BasePPOActor):
                             "position_ids": model_inputs["teacher_position_ids"],
                         }
                         teacher_model = self.teacher_module or self.actor_module
+                        if teacher_regularization == "trust-region" and (
+                            self.teacher_module is None or self.teacher_module is self.actor_module
+                        ):
+                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
                         with torch.no_grad():
                             teacher_outputs = self._forward_micro_batch(
                                 teacher_inputs,
@@ -890,5 +917,5 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         if did_update:
-            self._update_teacher_ema()
+            self._update_teacher()
         return metrics
