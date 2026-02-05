@@ -30,7 +30,7 @@ def load_dataset_hf(
     embeddings_file: str | None = None,
 ) -> Dataset:
 
-    final_columns = ["idx", "kind", "dataset", "answer", "elo", "prompt", "description", "tests", "embedding"]
+    final_columns = ["idx", "kind", "dataset", "answer", "elo", "prompt", "description", "tests", "embedding", "system"]
 
     if category == "false":
         category = None
