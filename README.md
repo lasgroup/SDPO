@@ -109,6 +109,7 @@ podman build . -f Dockerfile.gh200 -t sdpo-gh200
 
 # Export for cluster use (enroot/squashfs)
 enroot import -x mount -o sdpo-gh200.sqsh podman://localhost/sdpo-gh200:latest
+```
 
 > [!NOTE]
 > The Docker images use `requirements-gh200.txt` which contains pinned versions from `requirements-full.txt`, excluding packages pre-installed in the NGC vLLM container (torch, vllm, flash-attn, xformers, triton).
@@ -148,7 +149,7 @@ pip install -r requirements_sglang.txt
 
 ---
 
-### Requirements Files
+### Requirement Files
 
 | File | Description |
 |------|-------------|
@@ -172,6 +173,8 @@ pip install -r requirements_sglang.txt
 
 > [!NOTE]
 > For more specific instructions on `verl` architecture and advanced configuration, refer to the [official verl repository](https://github.com/volcengine/verl).
+
+---
 
 ### Data Preparation
 
@@ -211,6 +214,8 @@ python data/preprocess.py \
 ```
 `DATASET_PATH` should contain the `train.json` and `test.json` files.
 
+---
+
 ### Configuration
 Before running experiments, adapt the paths in `verl/trainer/config/user.yaml` to your environment:
 
@@ -220,6 +225,8 @@ vars:
   log_dir: /path/to/your/logs          # Directory for logs
   ckpt_dir: /path/to/your/checkpoints  # Directory for model checkpoints
 ```
+
+---
 
 ### Training
 
@@ -249,6 +256,8 @@ bash experiments/rich_feedback/run_baseline_grpo.sh
 ```bash
 bash experiments/rich_feedback/run_sdpo.sh
 ```
+
+---
 
 ### Multi-turn Baseline of Section 5
 
