@@ -1,0 +1,37 @@
+# Base: NGC vLLM container for aarch64 with CUDA 13.1, Python 3.12
+FROM nvcr.io/nvidia/vllm:25.12.post1-py3
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Unset ROCR_VISIBLE_DEVICES to prevent conflict with CUDA_VISIBLE_DEVICES
+# (cluster sets both, but verl requires only one)
+ENV ROCR_VISIBLE_DEVICES=""
+ENV NCCL_NET=Socket
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    wget \
+    curl \
+    build-essential \
+    libsndfile1 \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements file first (for layer caching)
+COPY requirements-gh200.txt /app/requirements-gh200.txt
+
+# Install Python dependencies (excluding NGC pre-installed packages)
+RUN pip install --no-cache-dir -r requirements-gh200.txt
+
+# Copy project files
+COPY . /app
+
+# Install verl/SDPO in editable mode (no-deps to avoid reinstalling dependencies)
+RUN pip install -e . --no-deps
+
+# Default command
+CMD ["/bin/bash"]

@@ -94,47 +94,81 @@ SDPO solves questions that neither the base model nor multi-turn interaction can
 *   **Python:** 3.12 (Tested on 3.12.3)
 *   **CUDA Driver:** Compatible with the PyTorch version installed (see below).
 
+---
+
 ### Installation
 
+#### Option 1: Docker (Recommended for HPC/GH200 Clusters)
+
+For NVIDIA GH200 (aarch64) clusters with CUDA 13.1, we provide a pre-configured Dockerfile based on the NGC vLLM container.
+
+**Build and deploy:**
+```bash
+# Build the image
+podman build . -f Dockerfile.gh200 -t sdpo-gh200
+
+# Export for cluster use (enroot/squashfs)
+enroot import -x mount -o sdpo-gh200.sqsh podman://localhost/sdpo-gh200:latest
+
+> [!NOTE]
+> The Docker images use `requirements-gh200.txt` which contains pinned versions from `requirements-full.txt`, excluding packages pre-installed in the NGC vLLM container (torch, vllm, flash-attn, xformers, triton).
+
+---
+
+#### Option 2: Local Installation
+
 1. **Install PyTorch:**
-Choose the version matching your GPU architecture:
 
 *   **For Ampere/Hopper (RTX 30/40, H100):**
     ```bash
-    # PyTorch 2.5.1 (Stable for CUDA 12.4)
     pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
     ```
 
 *   **For Blackwell (RTX 50, RTX PRO 2000 Blackwell):**
     ```bash
-    # PyTorch 2.7.0 (Support for CUDA 12.8 / sm_120)
     pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
     ```
 
-2. **Install SDPO and Dependences:**
-From the root of the repository:
+2. **Install SDPO and Dependencies:**
 ```bash
-# Install core dependencies (includes Blackwell fixes)
+# Install core dependencies (pinned versions)
 pip install -r requirements.txt
-
-# Install SGLang/vLLM stack (recommended for local high-perf)
-pip install -r requirements_sglang.txt
 
 # Install SDPO (verl) in editable mode
 pip install -e .
 
 # Install Flash Attention 2 (compiled from source)
-pip install -r requirements-cuda.txt --no-build-isolation
+pip install flash-attn --no-build-isolation
 ```
 
-### Advanced Components (vLLM & SGLang)
-This codebase supports vLLM and SGLang for high-throughput inference, which significantly accelerates the rollout phase of reinforcement learning. While optional for basic usage, they are recommended for large-scale training.
-
+3. **Optional: Install SGLang/vLLM for high-throughput inference:**
 ```bash
-# Install SGLang/vLLM stack
 pip install -r requirements_sglang.txt
 ```
-*Note: This command installs specific versions of SGLang and vLLM compatible with this codebase. Ensure your NVIDIA drivers are compatible with the installed CUDA toolkit.*
+
+---
+
+### Requirements Files
+
+| File | Description |
+|------|-------------|
+| `requirements.txt` | Core dependencies with pinned versions |
+| `requirements-gh200.txt` | For NGC vLLM container (excludes pre-installed packages) |
+| `requirements-full.txt` | Complete pip freeze from working environment |
+| `requirements_sglang.txt` | SGLang/vLLM stack for local inference |
+| `requirements-cuda.txt` | Flash Attention (for non-Docker installs) |
+
+**vLLM Version Note:**
+```
+# vllm==0.8.4       # GH200 cluster
+# vllm>=0.12.0      # Blackwell (RTX 50 series, B100/B200) - NOT FULLY TESTED
+```
+
+> [!WARNING]
+> Blackwell architecture support (RTX 50 series, B100/B200) has not been fully tested.
+
+> [!TIP]
+> For reproducibility, use `requirements-full.txt` which contains the exact versions from a tested environment.
 
 > [!NOTE]
 > For more specific instructions on `verl` architecture and advanced configuration, refer to the [official verl repository](https://github.com/volcengine/verl).

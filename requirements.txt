@@ -1,31 +1,35 @@
-# requirements.txt records the full set of dependencies for development
-accelerate
-codetiming
-datasets
-dill
-hydra-core
-liger-kernel
-numpy<2.0.0
-pandas
-peft
-pyarrow>=19.0.0
-pybind11
-pylatexenc
-pre-commit
-ray[default]
-tensordict>=0.8.0,<=0.10.0,!=0.9.0
-torchdata
-transformers>=4.42.2,<5.0.0
-# vllm==0.8.4 cluster
-# vllm>=0.12.0 blackwell
-wandb
-packaging>=20.0
-uvicorn
-fastapi
-latex2sympy2_extended
+# Core dependencies for SDPO development
+# Pinned versions from requirements-full.txt for reproducibility
+#
+# vLLM version depends on your target hardware:
+# vllm==0.8.4       # GH200 cluster
+# vllm>=0.12.0      # Blackwell (RTX 50 series, B100/B200) - NOT FULLY TESTED
+
+accelerate==1.12.0
+codetiming==1.4.0
+datasets==4.4.2
+dill==0.4.0
+hydra-core==1.3.2
+liger-kernel  # Optional: kernel optimizations
+numpy==2.1.0
+pandas==2.3.3
+peft==0.18.0
+pyarrow==22.0.0
+pybind11==3.0.1
+pylatexenc==2.10
+pre-commit  # Dev tool
+ray[default]==2.53.0
+tensordict==0.10.0
+torchdata==0.11.0
+transformers==4.57.1
+wandb==0.23.1
+packaging==25.0
+uvicorn==0.40.0
+fastapi==0.127.0
+latex2sympy2_extended==1.10.2
 math-verify[antlr4_9_3]==0.8.0
-tensorboard
-word2number
-latex2sympy2
-pyzmq
-psutil
+tensorboard==2.20.0
+word2number==1.1
+latex2sympy2==1.5.4
+pyzmq==27.1.0
+psutil==7.1.3
