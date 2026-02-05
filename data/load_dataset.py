@@ -30,7 +30,7 @@ def load_dataset_hf(
     embeddings_file: str | None = None,
 ) -> Dataset:
 
-    final_columns = ["idx", "kind", "dataset", "answer", "elo", "prompt", "description", "tests", "embedding"]
+    final_columns = ["idx", "kind", "dataset", "answer", "elo", "prompt", "description", "tests", "embedding", "system"]
 
     if category == "false":
         category = None
@@ -48,7 +48,7 @@ def load_dataset_hf(
     elif dataset_name == "tooluse":
         print("Tooluse dataset is already loaded. You can proceed to preprocess it.")
     elif dataset_name in ["Biology", "Chemistry", "Material", "Physics"]:
-        ds = load_sciknoweval(domain=dataset_name)
+        ds = load_sciknoweval(domain=dataset_name, level="L3")
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")
     ds = ds.add_column("idx", list(range(len(ds))))
