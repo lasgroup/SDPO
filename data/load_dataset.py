@@ -48,7 +48,11 @@ def load_dataset_hf(
     elif dataset_name == "tooluse":
         print("Tooluse dataset is already loaded. You can proceed to preprocess it.")
     elif dataset_name in ["Biology", "Chemistry", "Material", "Physics"]:
-        ds = load_sciknoweval(domain=dataset_name, level="L3")
+        ds = load_sciknoweval(
+            domains=[dataset_name],
+            levels=["L3"],
+            types=["mcq-4-choices", "mcq-2-choices"],
+        )
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")
     ds = ds.add_column("idx", list(range(len(ds))))

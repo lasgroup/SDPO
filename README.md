@@ -40,15 +40,13 @@ SDPO converts tokenized feedback into a dense learning signal without any extern
 
 ### Learning without Rich Environment Feedback
 
-<!-- SDPO turns successful rollouts into reusable supervision, allowing the policy to directly learn from its own best generations—without requiring external demonstrations or additional datasets. -->
-
 When environment feedback is sparse or rule-based, standard reinforcement learning methods struggle to propagate learning signals efficiently. SDPO addresses this by reusing high-reward rollouts as implicit feedback, providing dense supervision even in the absence of rich environment feedback.
 
 <p align="center">
 <img src="figures/chemistry-accuracy-response.png" alt="SDPO Performance vs. Training Steps" width="80%">
 </p>
 
-*Training progression of Olmo3-7B-Instruct on Chemistry. We report the average accuracy across 16 samples per question and a rolling average of response lengths over 5 steps. We report GRPO with the optimal hyperparameters for this model and task.*
+*Training progression of Olmo3-7B-Instruct on Chemistry. We report the average accuracy across 16 samples per question and a rolling average of response lengths over 5 steps. We report GRPO with the optimal hyperparameters for this model and task. We run each configuration for 3 seeds and report standard errors as shaded areas.*
 
 <p align="center">
 <img src="figures/table-no-rich-feedback.png" alt="SDPO Performance without Rich Environment Feedback" width="80%">
@@ -178,6 +176,10 @@ pip install -r requirements_sglang.txt
 
 ### Data Preparation
 
+The data is already loaded and split into train and test sets in the `datasets` directory. You can proceed to **preprocessing** the data.
+
+If you want to load and process the data yourself, you can run the following command:
+
 #### Data Loading
 The detailed instructions for loading the data are provided in `data/README.md`.
 
@@ -185,13 +187,13 @@ One example is provided below:
 ```bash
 python data/load_dataset.py \
     --dataset_name Chemistry \
-    --output_path datasets/chemistry.json
+    --output_path datasets/sciknoweval/chemistry.json
 ```
 
 To split the data into train and test sets, run the following command:
 ```bash
 python data/split_tasks.py \
-    --json_path datasets/chemistry.json \
+    --json_path datasets/sciknoweval/chemistry.json \
     --output_dir datasets/sciknoweval/chemistry \
     --test_ratio 0.1 \
     --seed 42
