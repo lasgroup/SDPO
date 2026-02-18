@@ -84,6 +84,7 @@ def load_dataset_hf(
     # Add correct suffix to each description
     ds = ds.map(lambda ex: {"description": ex["description"] + f" The solution will be evaluated in a {ex['kind']} environment."})
 
+    final_columns = [c for c in final_columns if c in ds.column_names]
     ds = ds.select_columns(final_columns)
 
 
