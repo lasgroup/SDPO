@@ -114,7 +114,7 @@ def run_proprocessing(data_source, num_proc=4):
     train_dataset = datasets.load_dataset("json", data_files=os.path.join(data_source, 'train.json'), split='train')
     try:
         test_dataset = datasets.load_dataset("json", data_files=os.path.join(data_source, 'test.json'), split='train')
-    except:
+    except Exception:
         test_dataset = datasets.load_dataset("json", data_files=os.path.join(data_source, 'test.json'), split='test')
 
     print(f"Map Datasets {train_dataset.num_rows} train, {test_dataset.num_rows} test")
