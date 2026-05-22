@@ -196,6 +196,18 @@ class vLLMAsyncRollout(BaseRollout):
         # please remove the VLLM_ASCEND_REQUIRED_ENV_VARS variable replacement action.
         # This is only a fix for vllm version < v0.13.0.
         if is_npu_available:
+            import sys
+            from types import ModuleType
+
+            # mock flash_attn.ops.triton.rotary
+            for name in ["flash_attn", "flash_attn.ops", "flash_attn.ops.triton", "flash_attn.ops.triton.rotary"]:
+                if name not in sys.modules:
+                    m = ModuleType(name)
+                    if name == "flash_attn.ops.triton.rotary":
+                        # define fake apply_rotary to prevent not found error
+                        m.apply_rotary = lambda *args, **kwargs: None
+                    sys.modules[name] = m
+            # Remember to remove following in NPU docker, as vllm version is always >= v0.13.0
             for k in VLLM_ASCEND_REQUIRED_ENV_VARS:
                 if k not in os.environ:
                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
