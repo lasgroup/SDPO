@@ -1,5 +1,7 @@
 #!/bin/bash
 unset VLLM_ATTENTION_BACKEND
+# if using NPU
+export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_USE_V1=1
 export PYTHONBUFFERED=1
 # export RAY_DEBUG=1
