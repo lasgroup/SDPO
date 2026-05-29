@@ -101,6 +101,12 @@ self_distillation:
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5
 
+  # Wheter to use Renyi-Regulation
+  renyi_regularization: False
+
+  # Renyi-Regulation level
+  renyi_regularization_level: 0.5
+
   # Teacher regularization method: "ema" or "trust-region"
   teacher_regularization: ema
 

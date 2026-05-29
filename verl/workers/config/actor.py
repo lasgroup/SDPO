@@ -45,6 +45,8 @@ class SelfDistillationConfig(BaseConfig):
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 0.25=Renyi-Forward KL, 0.75=Renyi-Reverse KL, 1.0=reverse KL, otherwise=JSD.
         rho (float): Rho parameter for Renyi-Forward KL and Renyi-Reverse KL, default=0.25.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
+        renyi_regularization (bool): Whether to use Renyi regularization for teacher updates.
+        renyi_regularization_level (float): Renyi regularization level (alpha) for teacher updates, only used if renyi_regularization is True.
         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
@@ -67,6 +69,8 @@ class SelfDistillationConfig(BaseConfig):
     alpha: float = 0.0
     rho: float = 0.25
     success_reward_threshold: float = 1.0
+    renyi_regularization: bool = False
+    renyi_regularization_level: float = 0.5
     teacher_regularization: str = "ema"
     teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None

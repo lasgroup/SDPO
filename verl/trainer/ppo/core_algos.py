@@ -1088,10 +1088,13 @@ def compute_self_distillation_loss(
     response_mask: torch.Tensor,
     self_distillation_config: Any,
     old_log_probs: Optional[torch.Tensor] = None,
+    ref_log_probs: Optional[torch.Tensor] = None,
     student_all_log_probs: Optional[torch.Tensor] = None,
     teacher_all_log_probs: Optional[torch.Tensor] = None,
+    ref_all_log_probs: Optional[torch.Tensor] = None,
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    ref_topk_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
@@ -1123,17 +1126,21 @@ def compute_self_distillation_loss(
 
             student_distill_log_probs = student_topk_log_probs
             teacher_distill_log_probs = teacher_topk_log_probs
+            ref_distill_log_probs = ref_topk_log_probs if ref_topk_log_probs is not None else None
             if self_distillation_config.distillation_add_tail:
                 student_distill_log_probs = add_tail(student_distill_log_probs)
                 teacher_distill_log_probs = add_tail(teacher_distill_log_probs)
+                ref_distill_log_probs = add_tail(ref_distill_log_probs) if ref_distill_log_probs is not None else None
             else:
                 student_distill_log_probs = renorm_topk_log_probs(student_distill_log_probs)
                 teacher_distill_log_probs = renorm_topk_log_probs(teacher_distill_log_probs)
+                ref_distill_log_probs = renorm_topk_log_probs(ref_distill_log_probs) if ref_distill_log_probs is not None else None
         else:
             if student_all_log_probs is None or teacher_all_log_probs is None:
                 raise ValueError("full_logit_distillation requires student_all_log_probs and teacher_all_log_probs.")
             student_distill_log_probs = student_all_log_probs
             teacher_distill_log_probs = teacher_all_log_probs
+            ref_distill_log_probs = ref_all_log_probs if ref_all_log_probs is not None else None
 
         if self_distillation_config.alpha == 0.0:
             kl_loss = F.kl_div(
@@ -1141,7 +1148,12 @@ def compute_self_distillation_loss(
             )
         elif self_distillation_config.alpha == 0.75: # Renyi-Reverse KL
             rho = getattr(self_distillation_config, "rho", 0.25)
-            kl_loss = torch.logsumexp(rho * student_distill_log_probs + (1 - rho) * teacher_distill_log_probs, dim=-1) / (rho - 1)
+            if self_distillation_config.renyi_regularization:
+                alpha_renyi = self_distillation_config.renyi_regularization_level
+                teacher_inputs = alpha_renyi * teacher_distill_log_probs + (1 - alpha_renyi) * ref_distill_log_probs
+            else:
+                teacher_inputs = teacher_distill_log_probs
+            kl_loss = torch.logsumexp(rho * student_distill_log_probs + (1 - rho) * teacher_inputs, dim=-1) / (rho - 1)
         elif self_distillation_config.alpha == 0.25: # Renyi-Forward KL
             rho = getattr(self_distillation_config, "rho", 0.25)
             kl_loss = torch.logsumexp(rho * teacher_distill_log_probs + (1 - rho) * student_distill_log_probs, dim=-1) / (rho - 1)

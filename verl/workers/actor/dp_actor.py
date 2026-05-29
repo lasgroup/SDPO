@@ -830,16 +830,37 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        ref_log_prob, ref_all_logps, ref_topk_logps = None, None, None
+
+                        if self_distillation_cfg.renyi_regularization:
+                            ref_model = self.actor_module
+                            with torch.no_grad():
+                                ref_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=ref_model,
+                                )
+                            ref_log_prob = ref_outputs["log_probs"]
+                            ref_all_logps = ref_outputs.get("all_logps") if return_all_logps else None
+                            ref_topk_logps = ref_outputs.get("topk_logps") if distill_topk else None
+                        
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,
                             response_mask=response_mask,
                             self_distillation_config=self_distillation_cfg,
                             old_log_probs=old_log_prob,
+                            ref_log_probs=ref_log_prob,
                             student_all_log_probs=student_all_logps,
                             teacher_all_log_probs=teacher_all_logps,
+                            ref_all_log_probs=ref_all_logps,
                             student_topk_log_probs=student_topk_logps,
                             teacher_topk_log_probs=teacher_topk_logps,
+                            ref_topk_log_probs=ref_topk_logps,
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
