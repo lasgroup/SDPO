@@ -79,6 +79,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.teacher_module: Optional[nn.Module] = None
+        self.renyi_ref_module: Optional[nn.Module] = None
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -833,7 +834,7 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob, ref_all_logps, ref_topk_logps = None, None, None
 
                         if self_distillation_cfg.renyi_regularization:
-                            ref_model = self.actor_module
+                            ref_model = self.renyi_ref_module or self.actor_module
                             with torch.no_grad():
                                 ref_outputs = self._forward_micro_batch(
                                     teacher_inputs,

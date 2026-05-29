@@ -903,6 +903,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         )
                     else:
                         self.actor.teacher_module = self.ref_module_fsdp
+                    
+                    if self_distillation_cfg.renyi_regularization:
+                        self.actor.renyi_ref_module = self.ref_module_fsdp
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
