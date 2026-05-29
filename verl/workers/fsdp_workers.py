@@ -905,7 +905,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         self.actor.teacher_module = self.ref_module_fsdp
                     
                     if self_distillation_cfg.renyi_regularization:
-                        self.actor.renyi_ref_module = self.ref_module_fsdp
+                        if teacher_regularization == "ema":
+                            # Keep the Renyi reference policy frozen. The EMA teacher mutates
+                            # self.ref_module_fsdp in-place, so Renyi regularization needs an
+                            # independent copy when the teacher uses EMA updates.
+                            self.renyi_ref_module_fsdp = self._build_model_optimizer(
+                                model_path=local_path,
+                                fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
+                                optim_config=None,
+                                override_model_config=override_model_config,
+                                use_remove_padding=use_remove_padding,
+                                use_fused_kernels=use_fused_kernels,
+                                trust_remote_code=self.config.model.get("trust_remote_code", False),
+                                use_liger=self.config.model.get("use_liger", False),
+                                role="renyi_ref",
+                                use_prefix_grouper=use_prefix_grouper,
+                                use_tiled_mlp=ref_use_tiled_mlp,
+                                tiled_mlp_shards=ref_tiled_mlp_shards,
+                            )[0]
+                            self.actor.renyi_ref_module = self.renyi_ref_module_fsdp
+                        else:
+                            self.actor.renyi_ref_module = self.ref_module_fsdp
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)

@@ -834,7 +834,9 @@ class DataParallelPPOActor(BasePPOActor):
                         ref_log_prob, ref_all_logps, ref_topk_logps = None, None, None
 
                         if self_distillation_cfg.renyi_regularization:
-                            ref_model = self.renyi_ref_module or self.actor_module
+                            if self.renyi_ref_module is None:
+                                raise ValueError("Renyi regularization requires a frozen renyi_ref_module.")
+                            ref_model = self.renyi_ref_module
                             with torch.no_grad():
                                 ref_outputs = self._forward_micro_batch(
                                     teacher_inputs,
