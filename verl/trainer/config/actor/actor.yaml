@@ -92,10 +92,10 @@ self_distillation:
   # Whether to add a tail bucket when using distillation_topk
   distillation_add_tail: True
 
-  # KL interpolation coefficient. 0.0=forward KL, 0.25=Renyi-Forward KL, 0.5=Renyi-Reverse KL, 1.0=reverse KL, otherwise=JSD.
+  # KL interpolation coefficient. 0.0=forward KL, 0.25=Renyi-Forward KL, 0.75=Renyi-Reverse KL, 1.0=reverse KL, otherwise=JSD.
   alpha: 0.5 
 
-  # Rho parameter for Renyi-Forward KL and Renyi-Reverse KL, default=0.25. Only used when alpha is 0.25 or 0.5.
+  # Rho parameter for Renyi-Forward KL and Renyi-Reverse KL, default=0.25. Only used when alpha is 0.25 or 0.75.
   rho: 0.25
 
   # Minimum sequence reward to be considered successful

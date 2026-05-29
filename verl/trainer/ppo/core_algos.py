@@ -1139,7 +1139,7 @@ def compute_self_distillation_loss(
             kl_loss = F.kl_div(
                 student_distill_log_probs, teacher_distill_log_probs, reduction="none", log_target=True
             )
-        elif self_distillation_config.alpha == 0.5: # Renyi-Reverse KL
+        elif self_distillation_config.alpha == 0.75: # Renyi-Reverse KL
             rho = getattr(self_distillation_config, "rho", 0.25)
             kl_loss = torch.logsumexp(rho * student_distill_log_probs + (1 - rho) * teacher_distill_log_probs, dim=-1) / (rho - 1)
         elif self_distillation_config.alpha == 0.25: # Renyi-Forward KL

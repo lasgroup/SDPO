@@ -42,7 +42,7 @@ class SelfDistillationConfig(BaseConfig):
     Args:
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
-        alpha (float): KL interpolation coefficient. 0.0=forward KL, 0.25=Renyi-Forward KL, 0.5=Renyi-Reverse KL, 1.0=reverse KL, otherwise=JSD.
+        alpha (float): KL interpolation coefficient. 0.0=forward KL, 0.25=Renyi-Forward KL, 0.75=Renyi-Reverse KL, 1.0=reverse KL, otherwise=JSD.
         rho (float): Rho parameter for Renyi-Forward KL and Renyi-Reverse KL, default=0.25.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
