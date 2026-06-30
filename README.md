@@ -349,7 +349,7 @@ If you find this work helpful, please cite us.
 ```bibtex
 @article{hubotter2026reinforcement,
   title = {Reinforcement Learning via Self-Distillation},
-  author = {Hübotter, Jonas and Lübeck, Frederike and Behric, Lejs and Baumann, Anton and Bagatella, Marco and Marta, Daniel and Hakimi, Ido and Shenfeld, Idan and Kleine Buening, Thomas and Guestrin, Carlos and Krause, Andreas},
+  author = {Hübotter, Jonas and Lübeck, Frederike and Behric, Lejs Deen and Baumann, Anton and Bagatella, Marco and Marta, Daniel and Hakimi, Ido and Shenfeld, Idan and Kleine Buening, Thomas and Guestrin, Carlos and Krause, Andreas},
   year = {2026},
   journal = {arXiv preprint arXiv:2601.20802},
 }
