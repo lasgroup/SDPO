@@ -121,6 +121,10 @@ ENV/
 
 # data
 *.parquet
+data/dapo_math_en/
+reports/
+eval_outputs/
+checkpoints/
 
 
 # local logs

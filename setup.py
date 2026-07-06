@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy>=1.26,<2.3",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",

@@ -23,6 +23,7 @@ PPO_RAY_RUNTIME_ENV = {
         "NCCL_DEBUG": "WARN",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         # symmetric memory allreduce not work properly in spmd mode
         "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",

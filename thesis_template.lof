@@ -1,0 +1,12 @@
+\babel@toc {vietnamese}{}\relax 
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\contentsline {figure}{\numberline {2.1}{\ignorespaces Mô hình hóa Quá trình ra quyết định Markov (MDP)}}{6}{figure.2.1}%
+\contentsline {figure}{\numberline {2.2}{\ignorespaces So sánh thiết lập RLVR và RLRF. Trong RLVR, tác tử học từ một phần thưởng vô hướng $r$, đóng vai trò như một nút thắt thông tin. Ngược lại, RLRF sử dụng các phản hồi dạng token, cung cấp tín hiệu dồi dào giải thích tại sao một nỗ lực lại thất bại.}}{9}{figure.2.2}%
+\contentsline {figure}{\numberline {2.3}{\ignorespaces Minh họa sự khác biệt kiến trúc giữa PPO (đòi hỏi Value Network) và GRPO (loại bỏ hoàn toàn Value Network thông qua lấy mẫu nhóm).}}{10}{figure.2.3}%
+\contentsline {figure}{\numberline {2.4}{\ignorespaces Minh họa sự khác biệt trong việc gán tín nhiệm giữa GRPO và SDPO đối với một bài toán suy luận Toán học. GRPO phạt toàn bộ chuỗi khi kết quả cuối cùng sai, trong khi cơ chế tự chưng cất của SDPO giúp phát hiện chính xác token gây ra lỗi logic (kích hoạt thưa thớt) và bỏ qua các phần suy luận hợp lệ theo sau.}}{15}{figure.2.4}%
+\contentsline {figure}{\numberline {2.5}{\ignorespaces Kiến trúc phân tán của Verl dựa trên nền tảng Ray.}}{18}{figure.2.5}%
+\contentsline {figure}{\numberline {2.6}{\ignorespaces Cơ chế cấp phát bộ nhớ động PagedAttention của vLLM giúp tăng tốc độ sinh dữ liệu.}}{19}{figure.2.6}%
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }

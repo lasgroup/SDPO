@@ -16,9 +16,20 @@
 import re
 import signal
 from typing import Optional
-from math_verify import parse as mv_parse, verify as mv_verify
+
+try:
+    from math_verify import parse as mv_parse, verify as mv_verify
+except ImportError:  # math-verify is optional for integer-only DAPO-Math training.
+    mv_parse = None
+    mv_verify = None
 
 FORMAT_PENALTY = False
+FORMAT_FEEDBACK = "Your answer had the wrong format. The solution must be given in the format: \\boxed{your_answer}."
+TRUNCATION_FEEDBACK = "Your response was truncated because it exceeded the maximum length."
+SAFE_WRONG_ANSWER_FEEDBACK = (
+    "Your boxed final answer was parsed, but it is incorrect. Recheck the reasoning and final calculation."
+)
+VALID_FEEDBACK_MODES = {"none", "safe", "oracle"}
 
 
 def last_boxed_only_string(string: str) -> Optional[str]:
@@ -69,6 +80,23 @@ def remove_boxed(s: str) -> str:
         return ""
 
 
+def normalize_answer(answer: str) -> str:
+    """Normalize simple final answers before exact comparison.
+
+    DAPO-Math processed English answers are all integer strings, but model outputs
+    may include harmless wrappers or separators.
+    """
+    answer = str(answer or "").strip()
+    answer = answer.strip("$")
+    answer = answer.replace("\\left", "").replace("\\right", "")
+    answer = answer.replace(",", "")
+    answer = re.sub(r"\\text\{([^{}]*)\}", r"\1", answer)
+    boxed = last_boxed_only_string(answer)
+    if boxed is not None:
+        answer = remove_boxed(boxed)
+    return re.sub(r"\s+", "", answer)
+
+
 class timeout:
     def __init__(self, seconds=1, error_message="Timeout"):
         self.seconds = seconds
@@ -109,7 +137,7 @@ def is_correct_strict_box(
     boxed_pred = last_boxed_only_string(pred)
     extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
 
-    return extracted_pred == gt, extracted_pred
+    return normalize_answer(extracted_pred or "") == normalize_answer(gt), extracted_pred
 
 
 def verify(
@@ -131,7 +159,7 @@ def verify(
         pred = ""
 
     # try Math-Verify equivalence check
-    if not correct and pred != "":
+    if not correct and pred != "" and mv_parse is not None and mv_verify is not None:
         try:
             with timeout(seconds=5):
                 gold_expr = mv_parse(answer)
@@ -140,6 +168,40 @@ def verify(
         except Exception:  # ignore any parsing/verification errors
             pass
     return correct, pred
+
+
+def resolve_feedback_mode(extra_info: Optional[dict], format_feedback: bool, correctness_feedback: bool) -> str:
+    """Resolve feedback behavior while preserving legacy keyword controls."""
+    if not format_feedback:
+        return "none"
+    if correctness_feedback:
+        return "oracle"
+
+    feedback_mode = "safe"
+    if extra_info is not None:
+        feedback_mode = str(extra_info.get("feedback_mode", feedback_mode)).lower()
+    if feedback_mode not in VALID_FEEDBACK_MODES:
+        raise ValueError(f"Invalid math feedback_mode={feedback_mode!r}. Expected one of {sorted(VALID_FEEDBACK_MODES)}.")
+    return feedback_mode
+
+
+def build_feedback(
+    *,
+    correct: bool,
+    incorrect_format: bool,
+    was_truncated: bool,
+    ground_truth: str,
+    feedback_mode: str,
+) -> str:
+    if feedback_mode == "none" or correct:
+        return ""
+    if was_truncated:
+        return TRUNCATION_FEEDBACK
+    if incorrect_format:
+        return FORMAT_FEEDBACK
+    if feedback_mode == "oracle":
+        return f"Your answer is incorrect. The correct answer is {ground_truth}."
+    return SAFE_WRONG_ANSWER_FEEDBACK
 
 
 def compute_score(
@@ -161,6 +223,7 @@ def compute_score(
     Returns:
         Reward score (1.0 for correct, 0 for incorrect)
     """
+    extra_info = extra_info or {}
     split = extra_info.get("split", "test")
     was_truncated = extra_info.get("truncated", False)
 
@@ -174,14 +237,14 @@ def compute_score(
     if FORMAT_PENALTY and split == "train" and incorrect_format and (not was_truncated):
         score -= 0.5
 
-    # Generate explicit feedback for format errors (analogous to code feedback)
-    feedback = ""
-    if incorrect_format and not was_truncated and format_feedback:
-        feedback = "Your answer had the wrong format. The solution must be given in the format: \\boxed{your_answer}."
-    elif was_truncated and format_feedback:
-        feedback = "Your response was truncated because it exceeded the maximum length."
-    elif not correct and correctness_feedback:
-        feedback = f"Your answer is incorrect. The correct answer is {ground_truth}."
+    feedback_mode = resolve_feedback_mode(extra_info, format_feedback, correctness_feedback)
+    feedback = build_feedback(
+        correct=correct,
+        incorrect_format=incorrect_format,
+        was_truncated=was_truncated,
+        ground_truth=ground_truth,
+        feedback_mode=feedback_mode,
+    )
 
     return {
         "score": score,
@@ -190,5 +253,7 @@ def compute_score(
         "incorrect_format": 1 if incorrect_format else 0,
         "truncated": 1 if was_truncated else 0,
         "truncated_and_missing_answer": 1 if incorrect_format and was_truncated else 0,
+        "feedback_mode": feedback_mode,
+        "math_verify_available": 1 if mv_parse is not None and mv_verify is not None else 0,
         "feedback": feedback,
     }

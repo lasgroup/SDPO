@@ -64,6 +64,7 @@ from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     apply_fsdp2,
+    collect_lora_and_base_params,
     collect_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
@@ -291,15 +292,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         tiled_mlp_shards=4,
     ):
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig
 
-        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import (
+            get_generation_config,
+            get_hf_auto_model_class,
+            print_model_size,
+            update_model_config,
+        )
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -329,7 +329,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = override_model_config.get("attn_implementation", "sdpa")
         actor_model_config = AutoConfig.from_pretrained(
             local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
@@ -371,31 +371,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
-            )
-            if has_remote_code:
-                auto_class = next(
-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
-                )
-                match auto_class:
-                    case "AutoModelForVision2Seq":
-                        actor_module_class = AutoModelForVision2Seq
-                    case "AutoModelForCausalLM":
-                        actor_module_class = AutoModelForCausalLM
-                    case "AutoModelForImageTextToText":
-                        actor_module_class = AutoModelForImageTextToText
-                    case _:
-                        actor_module_class = AutoModel
-            else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                    actor_module_class = AutoModelForVision2Seq
-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
-                    actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
-                    actor_module_class = AutoModelForImageTextToText
-                else:
-                    actor_module_class = AutoModel
+            actor_module_class = get_hf_auto_model_class(actor_model_config)
 
             actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
@@ -685,16 +661,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
         peft_config = None
+        needs_base_model_sync = False
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            sleep_level = getattr(self.rollout, "sleep_level", None)
+            needs_base_model_sync = not self.base_sync_done or sleep_level == 2
+            if needs_base_model_sync:
+                params, base_model_params = collect_lora_and_base_params(self.actor_module_fsdp)
+            else:
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=True,
+                )
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -702,16 +682,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         )
 
-        # Special handling for LoRA with sleep_level=2:
-        # When sleep_level=2, base model weights are destroyed during each sleep cycle.
-        # separately collect and update LoRA weights and base model weights through their respective interfaces.
-        # Here: params contains LoRA weights, base_model_params contains base model weights.
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-            base_model_params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.layered_summon,
-                base_sync_done=False,
-            )
+        # Level-2 sleep discards base weights, so reload the CPU snapshot before
+        # installing the current LoRA adapter.
+        if peft_config is not None and needs_base_model_sync:
             base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
             base_model_params = convert_weight_keys(
                 base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -723,11 +696,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         set_expandable_segments(False)
+        device = get_device_id()  # used when an FSDP2 DTensor must be materialized
 
-        if peft_config is not None and self.base_sync_done:
+        if peft_config is not None:
             per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
         else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in params.items()
@@ -737,7 +710,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+        if peft_config is not None and needs_base_model_sync:
             per_tensor_base_params = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
@@ -745,7 +718,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
             del base_model_params, per_tensor_base_params
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
@@ -846,9 +819,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if getattr(self, "tokenizer", None) is not None:
                 self.actor.tokenizer = self.tokenizer
 
-        if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-
         if self._is_ref:
             ref_model_path = self.config.model.path
             ref_model = self.config.ref.get("model", None)
@@ -903,6 +873,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         )
                     else:
                         self.actor.teacher_module = self.ref_module_fsdp
+                        self.actor.initialize_ema_teacher()
+
+        # SDPO colocates a CPU-offloaded reference teacher with vLLM. Build and
+        # offload the teacher before vLLM reserves GPU memory for its KV cache.
+        if self._is_rollout:
+            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -1331,7 +1307,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         from transformers import AutoConfig
 
         # override model kwargs
-        attn_implementation = override_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = override_config.get("attn_implementation", "sdpa")
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
             attn_implementation=attn_implementation,
@@ -1750,7 +1726,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         model_config = AutoConfig.from_pretrained(
             local_path,
             trust_remote_code=trust_remote_code,
-            attn_implementation=override_config.get("attn_implementation", "flash_attention_2"),
+            attn_implementation=override_config.get("attn_implementation", "sdpa"),
         )
         model_config.num_labels = 1
 

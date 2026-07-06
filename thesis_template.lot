@@ -1,0 +1,8 @@
+\babel@toc {vietnamese}{}\relax 
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\contentsline {table}{\numberline {2.1}{\ignorespaces Khuôn mẫu (Template) dành cho "teacher". \textcolor {blue}{prompt} được thay bằng câu hỏi. \textcolor {blue}{successful\_previous\_rollout} là lời giải mẫu chính xác được sinh ra trong cùng nhóm (sẽ bị bỏ qua đoạn này nếu không có). \textcolor {blue}{environment\_output} là phản hồi lỗi từ môi trường đối với nỗ lực giải ban đầu (bỏ qua nếu đã có lời giải mẫu). Nếu nỗ lực ban đầu là đúng, nó sẽ được chuyển thành lời giải mẫu. Cuối cùng, \textcolor {blue}{original\_response} được thay bằng câu trả lời gốc của mô hình để tính toán lại xác suất (log-probs) dưới lăng kính của teacher.}}{14}{table.2.1}%
+\addvspace {10\p@ }
+\contentsline {table}{\numberline {3.1}{\ignorespaces Bảng phân bổ Trọng số tín nhiệm cho các mục tiêu SDPO.}}{23}{table.3.1}%
+\addvspace {10\p@ }
+\addvspace {10\p@ }

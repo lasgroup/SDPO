@@ -637,8 +637,6 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                     }
                 else:
                     model = peft_model.base_model.model
-                    orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
-                    model = model.to("cpu")
                     for name, param in model.state_dict().items():
                         if any(x in name for x in ["_flat_param", "lora_"]):
                             continue
@@ -648,22 +646,54 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                             if hasattr(param, "full_tensor")
                             else param.detach().cpu()
                         )
-                    model = model.to(orig_dev)
             get_torch_device().empty_cache()
     else:
         if base_sync_done:
             lora_params = get_peft_model_state_dict(peft_model)
         else:
             model = peft_model.base_model.model
-            orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
-            model = model.to("cpu")
             for name, param in model.state_dict().items():
                 if any(x in name for x in ["_flat_param", "lora_"]):
                     continue
                 name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
                 lora_params[name] = param.detach().cpu()
-            model = model.to(orig_dev)
     return lora_params
+
+
+def collect_lora_and_base_params(module: FSDP) -> tuple[OrderedDict, OrderedDict]:
+    """Collect LoRA and frozen base tensors on CPU in one FSDP full-param context."""
+    from peft.utils.save_and_load import get_peft_model_state_dict
+
+    peft_model = getattr(module, "_fsdp_wrapped_module", module)
+
+    def collect() -> tuple[OrderedDict, OrderedDict]:
+        lora_params = OrderedDict(
+            (
+                name,
+                param.full_tensor().detach().cpu()
+                if hasattr(param, "full_tensor")
+                else param.detach().cpu(),
+            )
+            for name, param in get_peft_model_state_dict(peft_model).items()
+        )
+        base_params = OrderedDict()
+        for name, param in peft_model.base_model.model.state_dict().items():
+            if any(fragment in name for fragment in ("_flat_param", "lora_")):
+                continue
+            normalized_name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
+            base_params[normalized_name] = (
+                param.full_tensor().detach().cpu()
+                if hasattr(param, "full_tensor")
+                else param.detach().cpu()
+            )
+        return lora_params, base_params
+
+    if fsdp_version(module) > 0:
+        with FSDP.summon_full_params(module, writeback=False):
+            result = collect()
+        get_torch_device().empty_cache()
+        return result
+    return collect()
 
 
 def replace_lora_wrapper(k, peft_config):

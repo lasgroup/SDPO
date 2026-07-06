@@ -1093,6 +1093,7 @@ def compute_self_distillation_loss(
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_weight: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1102,6 +1103,12 @@ def compute_self_distillation_loss(
     loss_mask = response_mask
     if self_distillation_mask is not None:
         loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+    if self_distillation_weight is not None:
+        loss_mask = loss_mask * self_distillation_weight.unsqueeze(1)
+        metrics["self_distillation/reliability_weight_mean_actor"] = self_distillation_weight.mean().detach().item()
+        metrics["self_distillation/reliability_weight_nonzero_fraction_actor"] = (
+            (self_distillation_weight > 0).float().mean().detach().item()
+        )
 
     if self_distillation_config.full_logit_distillation:
         use_topk = self_distillation_config.distillation_topk is not None

@@ -13,7 +13,7 @@ def compute_score(
 ) -> dict:
     if data_source in ["code", "livecodebench", "humanevalplus"]:
         results = code.compute_score(solution_str, ground_truth, extra_info, sparse_rewards=True, max_test_cases=None)
-    elif data_source in ["math", "math500", "dapo_math", "gsm8k"]:
+    elif data_source in ["math", "math500", "dapo_math", "math_dapo", "gsm8k"]:
         results = math.compute_score(solution_str, ground_truth, extra_info)
     elif data_source in ["gpqa"]:
         results = gpqa.compute_score(solution_str, ground_truth)

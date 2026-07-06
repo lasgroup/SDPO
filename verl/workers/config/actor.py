@@ -58,6 +58,21 @@ class SelfDistillationConfig(BaseConfig):
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
+        sparse_target_execution (bool): Align active SDPO targets across data-parallel ranks and skip
+            student/teacher forwards for rows with zero SDPO loss.
+        reliability_weighting (bool): Whether to weight SDPO targets by heuristic target reliability.
+        reliability_min_weight (float): Lower bound for positive reliability weights.
+        reliability_success_weight (float): Weight for samples with a successful peer demonstration.
+        reliability_safe_feedback_weight (float): Weight for non-format safe feedback targets.
+        reliability_format_feedback_weight (float): Weight for format-only feedback targets.
+        reliability_truncated_weight (float): Weight for truncated targets.
+        reliability_gate_threshold (float): If positive, only samples with reliability weight greater
+            than or equal to this threshold are eligible for SDPO student/teacher forwards.
+        reliability_gate_max_fraction (Optional[float]): Optional upper bound on the fraction of each
+            training batch selected by the reliability gate. Highest-weight eligible targets are
+            retained first.
+        reliability_gate_sparse_execution (bool): Align gated samples across data-parallel ranks and skip
+            student and teacher forwards for rows rejected on every rank.
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
     """
@@ -90,6 +105,16 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    sparse_target_execution: bool = True
+    reliability_weighting: bool = False
+    reliability_min_weight: float = 0.0
+    reliability_success_weight: float = 1.0
+    reliability_safe_feedback_weight: float = 0.4
+    reliability_format_feedback_weight: float = 0.2
+    reliability_truncated_weight: float = 0.0
+    reliability_gate_threshold: float = 0.0
+    reliability_gate_max_fraction: Optional[float] = None
+    reliability_gate_sparse_execution: bool = True
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -110,6 +135,29 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        reliability_fields = {
+            "reliability_min_weight": self.reliability_min_weight,
+            "reliability_success_weight": self.reliability_success_weight,
+            "reliability_safe_feedback_weight": self.reliability_safe_feedback_weight,
+            "reliability_format_feedback_weight": self.reliability_format_feedback_weight,
+            "reliability_truncated_weight": self.reliability_truncated_weight,
+            "reliability_gate_threshold": self.reliability_gate_threshold,
+        }
+        for field_name, value in reliability_fields.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"self_distillation.{field_name} must be in [0,1], got {value}")
+        if self.reliability_gate_threshold > 0 and not self.reliability_weighting:
+            raise ValueError(
+                "self_distillation.reliability_gate_threshold requires "
+                "self_distillation.reliability_weighting=True"
+            )
+        if self.reliability_gate_max_fraction is not None and not (
+            0.0 < self.reliability_gate_max_fraction <= 1.0
+        ):
+            raise ValueError(
+                "self_distillation.reliability_gate_max_fraction must be in (0,1], got "
+                f"{self.reliability_gate_max_fraction}"
+            )
 
 
 @dataclass
@@ -360,6 +408,8 @@ class FSDPActorConfig(ActorConfig):
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        response_only_logits (bool): Whether supported causal LMs should apply the LM head only
+            to positions needed for response-token log probabilities.
     """
 
     strategy: str = "fsdp"
@@ -369,6 +419,7 @@ class FSDPActorConfig(ActorConfig):
     entropy_checkpointing: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
+    response_only_logits: bool = False
     use_rollout_log_probs: bool = False
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False

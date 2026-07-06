@@ -1,0 +1,156 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+# 2-GPU A100 SDPO-Math config. This file intentionally does not inherit user.yaml
+# because that file is cluster-specific and assumes 4 GPUs. The phase runner
+# overrides batch/token settings for the active A100 profile.
+
+# Rollout needs prompt + response. SDPO actor updates additionally score the
+# teacher reprompt plus the same response, so keep a separate actor budget.
+max_model_len: ${rollout_model_len}
+rollout_model_len: 6144
+actor_max_token_len: 8192
+
+data:
+  train_files: ["${oc.env:PROJECT_ROOT}/data/dapo_math_en/train.parquet"]
+  val_files: ["${oc.env:PROJECT_ROOT}/data/dapo_math_en/val.parquet"]
+  train_batch_size: 24
+  train_max_samples: -1
+  val_max_samples: -1
+  max_prompt_length: 2048
+  max_response_length: 2048
+  dataloader_num_workers: 0
+  filter_overlong_prompts: True
+  filter_overlong_prompts_workers: 1
+  truncation: error
+  shuffle: True
+  seed: 42
+  trust_remote_code: True
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+custom_reward_function:
+  path: ${oc.env:PROJECT_ROOT}/verl/utils/reward_score/feedback/__init__.py
+  name: compute_score
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-8B
+    trust_remote_code: True
+    override_config:
+      attn_implementation: sdpa
+    use_remove_padding: False
+    enable_gradient_checkpointing: True
+    lora_rank: 32
+    lora_alpha: 32
+
+  actor:
+    ppo_mini_batch_size: 24
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: False
+    shuffle: False
+    response_only_logits: True
+    ppo_max_token_len_per_gpu: ${actor_max_token_len}
+    clip_ratio_high: 0.28
+    use_kl_loss: False
+    loss_agg_mode: token-mean
+    entropy_coeff: 0
+    grad_clip: 1.0
+    optim:
+      lr: 5e-7
+      lr_warmup_steps: 10
+      weight_decay: 0.01
+    policy_loss:
+      loss_mode: sdpo
+    self_distillation:
+      full_logit_distillation: True
+      distillation_topk: 50
+      distillation_add_tail: True
+      alpha: 0.5
+      success_reward_threshold: 1.0
+      teacher_regularization: ema
+      teacher_update_rate: 0.01
+      max_reprompt_len: 4096
+      dont_reprompt_on_self_success: True
+      remove_thinking_from_demonstration: True
+      include_environment_feedback: False
+      environment_feedback_only_without_solution: True
+      sparse_target_execution: True
+      reliability_weighting: False
+      reliability_min_weight: 0.0
+      reliability_success_weight: 1.0
+      reliability_safe_feedback_weight: 0.4
+      reliability_format_feedback_weight: 0.2
+      reliability_truncated_weight: 0.0
+      reliability_gate_threshold: 0.0
+      reliability_gate_max_fraction: null
+      reliability_gate_sparse_execution: True
+      is_clip: 2.0
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_max_token_len_per_gpu: ${rollout_model_len}
+    fsdp_config:
+      param_offload: False
+
+  rollout:
+    name: vllm
+    n: 4
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    calculate_log_probs: True
+    tensor_model_parallel_size: 2
+    enforce_eager: True
+    gpu_memory_utilization: 0.88
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_max_token_len_per_gpu: ${rollout_model_len}
+    max_num_batched_tokens: 49152
+    max_num_seqs: 64
+    max_model_len: ${rollout_model_len}
+    agent:
+      num_workers: 8
+    val_kwargs:
+      n: 1
+      temperature: 0.01
+      top_p: 1.0
+      top_k: -1
+      do_sample: False
+
+critic:
+  model:
+    path: Qwen/Qwen3-8B
+    override_config:
+      attn_implementation: sdpa
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+reward_model:
+  use_reward_loop: False
+  reward_manager: naive
+
+reward_manager:
+  name: naive
+
+trainer:
+  project_name: SDPO-Math
+  group_name: SDPO-Math
+  experiment_name: sdpo_math_a100
+  logger: ["console"]
+  nnodes: 1
+  n_gpus_per_node: 2
+  val_before_train: False
+  test_freq: 10
+  save_freq: 20
+  total_epochs: 1
+  total_training_steps: null
+  max_actor_ckpt_to_keep: 2
+  default_local_dir: ${oc.env:PROJECT_ROOT}/checkpoints/sdpo_math/${trainer.experiment_name}
+  use_legacy_worker_impl: auto

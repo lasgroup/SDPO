@@ -281,6 +281,83 @@ def compute_advantage(
     return data
 
 
+def build_reliability_gate_schedule(
+    target_mask: torch.Tensor,
+    dp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Align selected targets across equal data-parallel shards.
+
+    Selected rows are placed first in every shard. The returned compute mask is
+    identical across shards and keeps a row whenever any rank has a selected
+    target at that local position.
+    """
+    if target_mask.ndim != 1 or target_mask.dtype != torch.bool:
+        raise ValueError("target_mask must be a one-dimensional boolean tensor")
+    if dp_size < 1 or target_mask.numel() % dp_size != 0:
+        raise ValueError(f"gate batch size {target_mask.numel()} must be divisible by dp_size={dp_size}")
+
+    batch_size = target_mask.numel()
+    local_batch_size = batch_size // dp_size
+    selected = torch.nonzero(target_mask, as_tuple=False).flatten()
+    rejected = torch.nonzero(~target_mask, as_tuple=False).flatten()
+    selected_count = selected.numel()
+    selected_per_rank = [selected_count // dp_size + int(rank < selected_count % dp_size) for rank in range(dp_size)]
+    if any(count > local_batch_size for count in selected_per_rank):
+        raise ValueError("gate scheduler assigned more selected rows than a data-parallel shard can hold")
+
+    permutation_parts = []
+    selected_offset = 0
+    rejected_offset = 0
+    for count in selected_per_rank:
+        rejected_count = local_batch_size - count
+        permutation_parts.extend(
+            [
+                selected[selected_offset : selected_offset + count],
+                rejected[rejected_offset : rejected_offset + rejected_count],
+            ]
+        )
+        selected_offset += count
+        rejected_offset += rejected_count
+
+    permutation = torch.cat(permutation_parts) if permutation_parts else torch.empty(0, dtype=torch.long)
+    max_selected_per_rank = max(selected_per_rank, default=0)
+    local_compute_mask = torch.arange(local_batch_size, device=target_mask.device) < max_selected_per_rank
+    compute_mask = local_compute_mask.repeat(dp_size)
+
+    if permutation.numel() != batch_size or torch.unique(permutation).numel() != batch_size:
+        raise RuntimeError("reliability gate schedule is not a valid permutation")
+    return permutation, compute_mask, selected_per_rank
+
+
+def apply_reliability_gate_budget(
+    eligible_mask: torch.Tensor,
+    reliability_weight: torch.Tensor,
+    max_fraction: Optional[float],
+) -> torch.Tensor:
+    """Retain the highest-reliability eligible rows within a batch compute budget."""
+    if eligible_mask.ndim != 1 or eligible_mask.dtype != torch.bool:
+        raise ValueError("eligible_mask must be a one-dimensional boolean tensor")
+    if reliability_weight.ndim != 1 or reliability_weight.shape != eligible_mask.shape:
+        raise ValueError("reliability_weight must match eligible_mask")
+    if max_fraction is None:
+        return eligible_mask
+    if not 0.0 < max_fraction <= 1.0:
+        raise ValueError(f"reliability gate max_fraction must be in (0,1], got {max_fraction}")
+
+    eligible_count = int(eligible_mask.sum().item())
+    max_targets = max(1, int(eligible_mask.numel() * max_fraction))
+    if eligible_count <= max_targets:
+        return eligible_mask
+
+    eligible_indices = torch.nonzero(eligible_mask, as_tuple=False).flatten()
+    eligible_weights = reliability_weight[eligible_indices]
+    priority = torch.argsort(eligible_weights, descending=True, stable=True)
+    selected_indices = eligible_indices[priority[:max_targets]]
+    selected_mask = torch.zeros_like(eligible_mask)
+    selected_mask[selected_indices] = True
+    return selected_mask
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -374,6 +451,32 @@ class RayPPOTrainer:
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _progress_heartbeat(self, event: str, **fields: Any) -> None:
+        """Write a lightweight driver-side progress event for file-logged runs."""
+        root_path = os.getenv("VERL_FILE_LOGGER_ROOT")
+        if not root_path:
+            return
+
+        try:
+            directory = os.path.join(
+                os.path.expanduser(root_path),
+                str(self.config.trainer.project_name),
+            )
+            os.makedirs(directory, exist_ok=True)
+            filepath = os.path.join(directory, f"{self.config.trainer.experiment_name}.progress.jsonl")
+            payload = {
+                "time": time.time(),
+                "event": event,
+                "step": int(getattr(self, "global_steps", 0)),
+                "total_steps": int(getattr(self, "total_training_steps", 0) or 0),
+            }
+            payload.update(fields)
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+        except Exception:
+            # Progress reporting must never affect training.
+            return
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -633,12 +736,24 @@ class RayPPOTrainer:
                     feedback_list[i] = raw_feedback[i]
         return feedback_list
 
-    def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
+    def _collect_solutions_by_uid(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        success_reward_threshold: float,
+        reward_extra_infos_dict: Optional[dict[str, list]] = None,
+    ) -> dict[Any, list[int]]:
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         uids = batch.non_tensor_batch["uid"]
         success_by_uid: dict[Any, list[int]] = defaultdict(list)
         for idx, uid in enumerate(uids):
-            if seq_scores[idx] >= success_reward_threshold:
+            is_truncated = self._truthy_reward_extra(
+                self._reward_extra_at(reward_extra_infos_dict, "truncated", idx, False)
+            )
+            incorrect_format = self._truthy_reward_extra(
+                self._reward_extra_at(reward_extra_infos_dict, "incorrect_format", idx, False)
+            )
+            if seq_scores[idx] >= success_reward_threshold and not is_truncated and not incorrect_format:
                 success_by_uid[uid].append(idx)
         return success_by_uid
 
@@ -658,8 +773,8 @@ class RayPPOTrainer:
     ) -> Optional[str]:
         uid = uids[idx]
         solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
+        if dont_reprompt_on_self_success and idx in solution_idxs:
+            return None
         if len(solution_idxs) == 0:
             return None
         solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
@@ -667,6 +782,218 @@ class RayPPOTrainer:
         if remove_thinking_from_demonstration:
             solution_str = self._remove_thinking_trace(solution_str)
         return solution_str
+
+    @staticmethod
+    def _truthy_reward_extra(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return bool(value.item())
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return bool(value)
+
+    @staticmethod
+    def _reward_extra_at(
+        reward_extra_infos_dict: Optional[dict[str, list]],
+        key: str,
+        idx: int,
+        default: Any = None,
+    ) -> Any:
+        if reward_extra_infos_dict is None:
+            return default
+        values = reward_extra_infos_dict.get(key)
+        if values is None or idx >= len(values):
+            return default
+        return values[idx]
+
+    def _prepare_sparse_self_distillation_actor_batch(
+        self, batch: DataProto
+    ) -> tuple[DataProto, dict[str, float]]:
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if self_distillation_cfg is None or loss_mode != "sdpo":
+            return batch, {}
+
+        threshold = float(self_distillation_cfg.get("reliability_gate_threshold", 0.0) or 0.0)
+        if "self_distillation_mask" not in batch.batch:
+            raise ValueError("sparse SDPO execution requires a self-distillation target mask")
+        if self.config.actor_rollout_ref.actor.get("shuffle", False):
+            raise ValueError("sparse SDPO execution requires actor.shuffle=False")
+
+        distillation_mask = batch.batch["self_distillation_mask"] > 0
+        reliability_weighting = bool(self_distillation_cfg.get("reliability_weighting", False))
+        weight = batch.batch.get("self_distillation_weight")
+        if threshold > 0:
+            if weight is None:
+                raise ValueError("reliability-gated SDPO requires reliability weights")
+            eligible_mask = (weight >= threshold) & distillation_mask
+            max_fraction = self_distillation_cfg.get("reliability_gate_max_fraction", None)
+            max_fraction = float(max_fraction) if max_fraction is not None else None
+            target_mask = apply_reliability_gate_budget(eligible_mask, weight, max_fraction)
+            sparse_execution = bool(self_distillation_cfg.get("reliability_gate_sparse_execution", True))
+        elif reliability_weighting:
+            if weight is None:
+                raise ValueError("reliability-weighted SDPO requires reliability weights")
+            target_mask = (weight > 0) & distillation_mask
+            sparse_execution = bool(self_distillation_cfg.get("sparse_target_execution", True))
+        else:
+            target_mask = distillation_mask
+            sparse_execution = bool(self_distillation_cfg.get("sparse_target_execution", True))
+
+        if sparse_execution:
+            if self.config.actor_rollout_ref.actor.get("use_dynamic_bsz", False):
+                raise ValueError("sparse SDPO execution requires actor.use_dynamic_bsz=False")
+            world_size = int(self.actor_rollout_wg.world_size)
+            sequence_parallel_size = int(
+                self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+            )
+            if world_size % sequence_parallel_size != 0:
+                raise ValueError(
+                    f"actor world_size={world_size} must be divisible by sequence parallel size={sequence_parallel_size}"
+                )
+            dp_size = world_size // sequence_parallel_size
+            permutation, compute_mask, selected_per_rank = build_reliability_gate_schedule(target_mask, dp_size)
+            actor_batch = batch[permutation]
+            target_mask = target_mask[permutation]
+        else:
+            actor_batch = batch
+            compute_mask = torch.ones_like(target_mask, dtype=torch.bool)
+            selected_per_rank = [int(target_mask.sum().item())]
+
+        batch_device = actor_batch.batch["self_distillation_mask"].device
+        compute_mask = compute_mask.to(device=batch_device)
+        target_mask = target_mask.to(device=batch_device)
+        if torch.any(target_mask & ~compute_mask):
+            raise RuntimeError("reliability gate schedule dropped a selected target")
+        if threshold > 0:
+            actor_batch.batch["self_distillation_weight"] = torch.where(
+                target_mask,
+                actor_batch.batch["self_distillation_weight"],
+                torch.zeros_like(actor_batch.batch["self_distillation_weight"]),
+            )
+        actor_batch.batch["self_distillation_sparse_compute_mask"] = compute_mask
+
+        teacher_attention = actor_batch.batch["teacher_attention_mask"].float()
+        response_mask = actor_batch.batch["response_mask"].float()
+        target_teacher_tokens = (teacher_attention * target_mask.unsqueeze(1)).sum()
+        compute_teacher_tokens = (teacher_attention * compute_mask.unsqueeze(1)).sum()
+        total_teacher_tokens = teacher_attention.sum().clamp(min=1.0)
+        target_response_tokens = (response_mask * target_mask.unsqueeze(1)).sum()
+        compute_response_tokens = (response_mask * compute_mask.unsqueeze(1)).sum()
+        total_response_tokens = response_mask.sum().clamp(min=1.0)
+
+        metrics = {
+            "self_distillation/sparse_execution": float(sparse_execution),
+            "self_distillation/sparse_target_fraction": target_mask.float().mean().item(),
+            "self_distillation/sparse_compute_fraction": compute_mask.float().mean().item(),
+            "self_distillation/sparse_alignment_overhead_fraction": (
+                compute_mask.float().mean() - target_mask.float().mean()
+            ).item(),
+            "self_distillation/sparse_target_teacher_token_fraction": (
+                target_teacher_tokens / total_teacher_tokens
+            ).item(),
+            "self_distillation/sparse_compute_teacher_token_fraction": (
+                compute_teacher_tokens / total_teacher_tokens
+            ).item(),
+            "self_distillation/sparse_target_response_token_fraction": (
+                target_response_tokens / total_response_tokens
+            ).item(),
+            "self_distillation/sparse_compute_response_token_fraction": (
+                compute_response_tokens / total_response_tokens
+            ).item(),
+            "self_distillation/sparse_max_targets_per_rank": float(max(selected_per_rank, default=0)),
+        }
+        if threshold > 0:
+            metrics.update(
+                {
+                    "self_distillation/reliability_gate_sparse_execution": float(sparse_execution),
+                    "self_distillation/reliability_gate_max_fraction": (
+                        float(max_fraction) if max_fraction is not None else 1.0
+                    ),
+                    "self_distillation/reliability_gate_eligible_fraction": eligible_mask.float().mean().item(),
+                    "self_distillation/reliability_gate_target_fraction": metrics[
+                        "self_distillation/sparse_target_fraction"
+                    ],
+                    "self_distillation/reliability_gate_compute_fraction": metrics[
+                        "self_distillation/sparse_compute_fraction"
+                    ],
+                    "self_distillation/reliability_gate_alignment_overhead_fraction": metrics[
+                        "self_distillation/sparse_alignment_overhead_fraction"
+                    ],
+                    "self_distillation/reliability_gate_compute_teacher_token_fraction": metrics[
+                        "self_distillation/sparse_compute_teacher_token_fraction"
+                    ],
+                }
+            )
+        return actor_batch, metrics
+
+    def _compute_self_distillation_weights(
+        self,
+        self_distillation_cfg,
+        solution_strs: list[Optional[str]],
+        feedback_used: list[bool],
+        reward_extra_infos_dict: Optional[dict[str, list]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        weights: list[float] = []
+        success_count = 0
+        safe_feedback_count = 0
+        format_feedback_count = 0
+        truncated_count = 0
+
+        for i, solution_str in enumerate(solution_strs):
+            has_solution = solution_str is not None
+            has_feedback = feedback_used[i]
+            is_truncated = self._truthy_reward_extra(
+                self._reward_extra_at(reward_extra_infos_dict, "truncated", i, False)
+            )
+            incorrect_format = self._truthy_reward_extra(
+                self._reward_extra_at(reward_extra_infos_dict, "incorrect_format", i, False)
+            )
+
+            if is_truncated:
+                weight = float(self_distillation_cfg.get("reliability_truncated_weight", 0.0))
+                if has_solution or has_feedback:
+                    truncated_count += 1
+            elif has_solution:
+                weight = float(self_distillation_cfg.get("reliability_success_weight", 1.0))
+                success_count += 1
+            elif has_feedback and incorrect_format:
+                weight = float(self_distillation_cfg.get("reliability_format_feedback_weight", 0.2))
+                format_feedback_count += 1
+            elif has_feedback:
+                weight = float(self_distillation_cfg.get("reliability_safe_feedback_weight", 0.4))
+                safe_feedback_count += 1
+            else:
+                weight = 0.0
+
+            if weight > 0:
+                weight = max(weight, float(self_distillation_cfg.get("reliability_min_weight", 0.0)))
+            weights.append(weight)
+
+        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+        nonzero = weight_tensor > 0
+        gate_threshold = float(self_distillation_cfg.get("reliability_gate_threshold", 0.0) or 0.0)
+        batch_size = max(len(weights), 1)
+        metrics = {
+            "self_distillation/reliability_weight_mean": weight_tensor.mean().item() if len(weights) > 0 else 0.0,
+            "self_distillation/reliability_weight_nonzero_fraction": nonzero.float().mean().item() if len(weights) > 0 else 0.0,
+            "self_distillation/reliability_peer_solution_weight_fraction": success_count / batch_size,
+            "self_distillation/reliability_safe_feedback_weight_fraction": safe_feedback_count / batch_size,
+            "self_distillation/reliability_format_feedback_weight_fraction": format_feedback_count / batch_size,
+            "self_distillation/reliability_truncated_weight_fraction": truncated_count / batch_size,
+        }
+        if gate_threshold > 0:
+            gated = weight_tensor >= gate_threshold
+            metrics.update(
+                {
+                    "self_distillation/reliability_gate_threshold": gate_threshold,
+                    "self_distillation/reliability_gate_eligible_fraction": gated.float().mean().item()
+                    if len(weights) > 0
+                    else 0.0,
+                    "self_distillation/reliability_gate_eligible_count": gated.sum().item(),
+                }
+            )
+        return weight_tensor, metrics
 
 
     def _maybe_build_self_distillation_batch(
@@ -694,7 +1021,12 @@ class RayPPOTrainer:
             batch_size=batch_size,
         )
 
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+        success_by_uid = self._collect_solutions_by_uid(
+            batch,
+            reward_tensor,
+            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+        )
         solution_strs = [
             self._get_solution(
                 i,
@@ -777,23 +1109,40 @@ class RayPPOTrainer:
             device=device
         )
 
-        uids = set(batch.non_tensor_batch["uid"])
-        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
-        num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
-        metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
-            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
-        }
-        return DataProto.from_dict(tensors={
+        tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
-        }), metrics
+        }
+
+        uids = set(batch.non_tensor_batch["uid"])
+        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+        num_with_feedback_used = sum(1 for f in feedback_used if f)
+        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_self_success = sum(
+            1 for i, uid in enumerate(batch.non_tensor_batch["uid"]) if i in success_by_uid[uid]
+        )
+        metrics = {
+            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "self_distillation/self_success_sample_fraction": num_self_success / batch_size,
+            "self_distillation/peer_solution_sample_fraction": num_with_solution / batch_size,
+            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+        }
+        if self_distillation_cfg.get("reliability_weighting", False):
+            reliability_weight, reliability_metrics = self._compute_self_distillation_weights(
+                self_distillation_cfg=self_distillation_cfg,
+                solution_strs=solution_strs,
+                feedback_used=feedback_used,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                device=device,
+            )
+            tensors["self_distillation_weight"] = reliability_weight
+            metrics.update(reliability_metrics)
+
+        return DataProto.from_dict(tensors=tensors), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -997,7 +1346,9 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._progress_heartbeat("resource_pool_start")
         self.resource_pool_manager.create_resource_pool()
+        self._progress_heartbeat("resource_pool_done")
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
@@ -1109,6 +1460,7 @@ class RayPPOTrainer:
                 )
         wg_kwargs["device_name"] = self.device_name
 
+        self._progress_heartbeat("worker_spawn_start")
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
@@ -1118,6 +1470,7 @@ class RayPPOTrainer:
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
+        self._progress_heartbeat("worker_spawn_done")
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
@@ -1150,7 +1503,9 @@ class RayPPOTrainer:
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
+        self._progress_heartbeat("actor_model_init_start")
         self.actor_rollout_wg.init_model()
+        self._progress_heartbeat("actor_model_init_done")
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -1171,11 +1526,13 @@ class RayPPOTrainer:
         else:
             rm_resource_pool = None
 
+        self._progress_heartbeat("agent_loop_init_start")
         self.async_rollout_manager = AgentLoopManager(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rm_resource_pool=rm_resource_pool,
         )
+        self._progress_heartbeat("agent_loop_init_done")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1579,11 +1936,14 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            self._progress_heartbeat("validation_start", validation="initial")
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            self._progress_heartbeat("validation_done", validation="initial")
             if self.config.trainer.get("val_only", False):
+                self._progress_heartbeat("val_only_done")
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -1592,6 +1952,7 @@ class RayPPOTrainer:
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        self._progress_heartbeat("train_start")
 
         # we start from step 1
         self.global_steps += 1
@@ -1636,9 +1997,11 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                self._progress_heartbeat("step_start")
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        self._progress_heartbeat("gen_start")
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
@@ -1646,6 +2009,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        self._progress_heartbeat("gen_done")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1705,6 +2069,7 @@ class RayPPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        self._progress_heartbeat("reward_start")
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
@@ -1723,6 +2088,7 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
+                        self._progress_heartbeat("reward_done")
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1740,6 +2106,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            self._progress_heartbeat("old_log_prob_start")
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1762,14 +2129,17 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                            self._progress_heartbeat("old_log_prob_done")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            self._progress_heartbeat("ref_log_prob_start")
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                            self._progress_heartbeat("ref_log_prob_done")
 
                     # compute values
                     if self.use_critic:
@@ -1778,6 +2148,7 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        self._progress_heartbeat("adv_start")
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1831,6 +2202,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        self._progress_heartbeat("adv_done")
 
                     # update critic
                     if self.use_critic:
@@ -1843,9 +2215,15 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                            self._progress_heartbeat("actor_update_start")
+                            actor_batch, sparse_execution_metrics = (
+                                self._prepare_sparse_self_distillation_actor_batch(batch)
+                            )
+                            metrics.update(sparse_execution_metrics)
+                            actor_output = self._update_actor(actor_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        self._progress_heartbeat("actor_update_done")
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1859,9 +2237,11 @@ class RayPPOTrainer:
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
+                        self._progress_heartbeat("validation_start", validation="periodic")
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
+                        self._progress_heartbeat("validation_done", validation="periodic")
                     metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
@@ -1925,6 +2305,7 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._progress_heartbeat("step_done")
 
                 progress_bar.update(1)
                 self.global_steps += 1

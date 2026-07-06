@@ -15,8 +15,10 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import json
 import os
 import socket
+import time
 
 import hydra
 import ray
@@ -30,6 +32,32 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
+
+
+def write_progress_heartbeat(config, event: str, **fields) -> None:
+    """Write a lightweight progress event before the trainer loop exists."""
+    root_path = os.getenv("VERL_FILE_LOGGER_ROOT")
+    if not root_path:
+        return
+
+    try:
+        project_name = str(config.trainer.project_name)
+        experiment_name = str(config.trainer.experiment_name)
+        directory = os.path.join(os.path.expanduser(root_path), project_name)
+        os.makedirs(directory, exist_ok=True)
+        filepath = os.path.join(directory, f"{experiment_name}.progress.jsonl")
+        total_steps = config.trainer.get("total_training_steps", 0) or 0
+        payload = {
+            "time": time.time(),
+            "event": event,
+            "step": int(fields.pop("step", 0)),
+            "total_steps": int(total_steps),
+        }
+        payload.update(fields)
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+    except Exception:
+        return
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -57,6 +85,7 @@ def run_ppo(config, task_runner_class=None) -> None:
     """
     # Check if Ray is not initialized
     if not ray.is_initialized():
+        write_progress_heartbeat(config, "ray_init_start")
         # Initialize Ray with a local cluster configuration
         # Set environment variables in the runtime environment to control tokenizer parallelism,
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
@@ -75,6 +104,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        write_progress_heartbeat(config, "ray_init_done")
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
@@ -285,9 +315,11 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        write_progress_heartbeat(config, "task_start")
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        write_progress_heartbeat(config, "config_resolved")
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
@@ -299,6 +331,7 @@ class TaskRunner:
         # finally, we combine all the rewards together
         # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
+        write_progress_heartbeat(config, "roles_registered")
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
@@ -309,34 +342,42 @@ class TaskRunner:
             use_reference_policy=need_reference_policy(config),
             use_critic=need_critic(config),
         )
+        write_progress_heartbeat(config, "config_validated")
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        write_progress_heartbeat(config, "checkpoint_local_start", model=str(config.actor_rollout_ref.model.path))
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
+        write_progress_heartbeat(config, "checkpoint_local_done", model=str(config.actor_rollout_ref.model.path))
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
+        write_progress_heartbeat(config, "tokenizer_start")
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        write_progress_heartbeat(config, "tokenizer_done")
 
         # Load the reward manager for training and validation.
+        write_progress_heartbeat(config, "reward_manager_start")
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         val_reward_fn = load_reward_manager(
             config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
+        write_progress_heartbeat(config, "reward_manager_done")
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
+        write_progress_heartbeat(config, "dataset_start")
         train_dataset = create_rl_dataset(
             config.data.train_files,
             config.data,
@@ -354,6 +395,12 @@ class TaskRunner:
             max_samples=config.data.get("val_max_samples", -1),
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        write_progress_heartbeat(
+            config,
+            "dataset_done",
+            train_rows=len(train_dataset),
+            val_rows=len(val_dataset),
+        )
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
@@ -370,11 +417,16 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
+        write_progress_heartbeat(config, "trainer_constructed")
         # Initialize the workers of the trainer.
+        write_progress_heartbeat(config, "init_workers_start")
         trainer.init_workers()
+        write_progress_heartbeat(config, "init_workers_done")
 
         # Start the training process.
+        write_progress_heartbeat(config, "fit_start")
         trainer.fit()
+        write_progress_heartbeat(config, "fit_done")
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):

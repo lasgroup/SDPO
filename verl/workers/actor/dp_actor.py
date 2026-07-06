@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 from types import SimpleNamespace
 from typing import Optional
 
@@ -42,10 +43,48 @@ from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, uly
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
-__all__ = ["DataParallelPPOActor"]
+__all__ = ["DataParallelPPOActor", "response_only_logits_kwargs"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def response_only_logits_kwargs(
+    model: nn.Module,
+    response_length: int,
+    *,
+    enabled: bool,
+    use_remove_padding: bool,
+    use_fused_kernels: bool,
+) -> dict[str, int]:
+    """Return exact response-only LM-head kwargs for supported causal LMs."""
+    if not enabled or use_remove_padding or use_fused_kernels:
+        return {}
+
+    current = model
+    visited = set()
+    wrapper_types = []
+    for _ in range(16):
+        if id(current) in visited:
+            break
+        visited.add(id(current))
+        wrapper_types.append(type(current).__name__)
+        config = getattr(current, "config", None)
+        if getattr(config, "model_type", None) == "qwen3":
+            return {"logits_to_keep": response_length + 1}
+        next_module = None
+        for attr in ("module", "_fsdp_wrapped_module", "base_model", "model"):
+            candidate = getattr(current, attr, None)
+            if isinstance(candidate, nn.Module) and candidate is not current:
+                next_module = candidate
+                break
+        if next_module is None:
+            break
+        current = next_module
+    raise ValueError(
+        "response_only_logits=True requires a supported Qwen3 causal LM; "
+        f"inspected wrappers={wrapper_types}"
+    )
 
 
 class TrustRegionTeacher(nn.Module):
@@ -129,26 +168,57 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
-    def _update_teacher(self) -> None:
+    def _trainable_teacher_parameter_pairs(self) -> list[tuple[str, nn.Parameter, nn.Parameter]]:
+        if self.teacher_module is None or self.teacher_module is self.actor_module:
+            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+
+        teacher_parameters = dict(self.teacher_module.named_parameters())
+        trainable_student_parameters = {
+            name: parameter for name, parameter in self.actor_module.named_parameters() if parameter.requires_grad
+        }
+        missing = sorted(set(trainable_student_parameters) - set(teacher_parameters))
+        if missing:
+            raise ValueError(f"EMA teacher is missing {len(missing)} trainable student parameters; first={missing[0]}")
+
+        pairs = []
+        for name, student_param in trainable_student_parameters.items():
+            teacher_param = teacher_parameters[name]
+            if teacher_param.shape != student_param.shape:
+                raise ValueError(
+                    f"EMA teacher/student shape mismatch for {name}: "
+                    f"teacher={tuple(teacher_param.shape)} student={tuple(student_param.shape)}"
+                )
+            pairs.append((name, teacher_param, student_param))
+        return pairs
+
+    def initialize_ema_teacher(self) -> tuple[int, int]:
+        pairs = self._trainable_teacher_parameter_pairs()
+        with torch.no_grad():
+            for _, teacher_param, student_param in pairs:
+                teacher_param.data.copy_(student_param.data.to(device=teacher_param.device))
+        return len(pairs), sum(student_param.numel() for _, _, student_param in pairs)
+
+    def _update_teacher(self) -> tuple[int, int]:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         if not self_distillation_cfg or loss_mode != "sdpo":
-            return
+            return 0, 0
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
-            return
+            return 0, 0
         update_rate = getattr(self_distillation_cfg, "teacher_update_rate", 0.0)
         if update_rate == 0.0:
-            return
-        if self.teacher_module is None or self.teacher_module is self.actor_module:
-            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+            return 0, 0
+
+        updated_tensors = 0
+        updated_elements = 0
         with torch.no_grad():
-            for teacher_param, student_param in zip(
-                self.teacher_module.parameters(),
-                self.actor_module.parameters(),
-            ):
+            for _, teacher_param, student_param in self._trainable_teacher_parameter_pairs():
                 student_data = student_param.data.to(device=teacher_param.device)
                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+                updated_tensors += 1
+                updated_elements += student_param.numel()
+        return updated_tensors, updated_elements
 
     @staticmethod
     def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
@@ -202,6 +272,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Logit distillation requires disabling fused kernels.")
 
         model = module or self.actor_module
+        response_only_logits = bool(self.config.get("response_only_logits", False))
 
         # PrefixGrouper path for shared-prefix optimization
         if self.use_prefix_grouper:
@@ -503,6 +574,15 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                extra_args.update(
+                    response_only_logits_kwargs(
+                        model,
+                        response_length,
+                        enabled=response_only_logits,
+                        use_remove_padding=self.use_remove_padding,
+                        use_fused_kernels=self.use_fused_kernels,
+                    )
+                )
 
                 output = model(
                     input_ids=input_ids,
@@ -683,13 +763,22 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "sdpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        reliability_gate_threshold = 0.0
+        reliability_weighting = False
         if self_distillation_enabled:
+            reliability_gate_threshold = float(
+                self_distillation_cfg.get("reliability_gate_threshold", 0.0) or 0.0
+            )
+            reliability_weighting = bool(self_distillation_cfg.get("reliability_weighting", False))
             self_distillation_required_keys = {
                 "teacher_input_ids",
                 "teacher_attention_mask",
                 "teacher_position_ids",
                 "self_distillation_mask",
+                "self_distillation_sparse_compute_mask",
             }
+            if reliability_gate_threshold > 0 or reliability_weighting:
+                self_distillation_required_keys.add("self_distillation_weight")
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -707,6 +796,11 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
+            if (
+                "self_distillation_weight" in data.batch.keys()
+                and "self_distillation_weight" not in self_distillation_required_keys
+            ):
+                select_keys.append("self_distillation_weight")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -749,20 +843,18 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                mini_batch_did_backward = False
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
-                    self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
@@ -771,12 +863,103 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
-                    if teacher_regularization == "trust-region" and self.use_fused_kernels:
-                        raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                    sparse_metrics = {}
+                    if self_distillation_enabled:
+                        self_distillation_mask = model_inputs["self_distillation_mask"]
+                        self_distillation_weight = model_inputs.get("self_distillation_weight")
+                        if reliability_gate_threshold > 0:
+                            sparse_target_mask = (
+                                self_distillation_weight >= reliability_gate_threshold
+                            ) & (self_distillation_mask > 0)
+                        elif reliability_weighting:
+                            sparse_target_mask = (self_distillation_weight > 0) & (self_distillation_mask > 0)
+                        else:
+                            sparse_target_mask = self_distillation_mask > 0
+                        sparse_compute_mask = model_inputs["self_distillation_sparse_compute_mask"].bool()
+                        if torch.any(sparse_target_mask & ~sparse_compute_mask):
+                            raise RuntimeError("sparse SDPO compute mask dropped an active target")
+
+                        total_response_tokens = response_mask.sum().clamp(min=1.0)
+                        compute_response_tokens = (response_mask * sparse_compute_mask.unsqueeze(1)).sum()
+                        sparse_metrics = {
+                            "self_distillation/sparse_target_fraction_actor": sparse_target_mask.float()
+                            .mean()
+                            .detach()
+                            .item(),
+                            "self_distillation/sparse_compute_fraction_actor": sparse_compute_mask.float()
+                            .mean()
+                            .detach()
+                            .item(),
+                            "self_distillation/sparse_compute_response_token_fraction_actor": (
+                                compute_response_tokens / total_response_tokens
+                            )
+                            .detach()
+                            .item(),
+                            "self_distillation/sparse_skipped_micro_batch_actor": float(
+                                not sparse_compute_mask.any().item()
+                            ),
+                        }
+                        if reliability_gate_threshold > 0:
+                            sparse_metrics.update(
+                                {
+                                    "self_distillation/reliability_gate_threshold_actor": reliability_gate_threshold,
+                                    "self_distillation/reliability_gate_target_fraction_actor": sparse_metrics[
+                                        "self_distillation/sparse_target_fraction_actor"
+                                    ],
+                                    "self_distillation/reliability_gate_compute_fraction_actor": sparse_metrics[
+                                        "self_distillation/sparse_compute_fraction_actor"
+                                    ],
+                                }
+                            )
+                        if not sparse_compute_mask.any().item():
+                            sparse_metrics["self_distillation/empty_target_batch"] = 1.0
+                            append_to_dict(metrics, sparse_metrics)
+                            continue
+
+                        def _select_compute_rows(value):
+                            if (
+                                isinstance(value, torch.Tensor)
+                                and value.ndim > 0
+                                and value.shape[0] == sparse_compute_mask.shape[0]
+                            ):
+                                return value[sparse_compute_mask]
+                            return value
+
+                        model_inputs = {key: _select_compute_rows(value) for key, value in model_inputs.items()}
+                        response_mask = model_inputs["response_mask"]
+                        if reliability_gate_threshold > 0:
+                            selected_target_mask = sparse_target_mask[sparse_compute_mask]
+                            model_inputs["self_distillation_weight"] = torch.where(
+                                selected_target_mask,
+                                model_inputs["self_distillation_weight"],
+                                torch.zeros_like(model_inputs["self_distillation_weight"]),
+                            )
+
+                    old_log_prob = model_inputs["old_log_probs"]
+                    advantages = model_inputs["advantages"]
+                    self_distillation_mask = (
+                        model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    )
+                    self_distillation_weight = (
+                        model_inputs.get("self_distillation_weight") if self_distillation_enabled else None
+                    )
+
+                    return_all_logps = False
+                    distill_topk = None
+                    if self_distillation_enabled:
+                        teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                        if teacher_regularization == "trust-region" and self.use_fused_kernels:
+                            raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                        return_all_logps = (
+                            self_distillation_cfg.full_logit_distillation
+                            and not self_distillation_cfg.distillation_topk
+                        )
+                        distill_topk = (
+                            self_distillation_cfg.distillation_topk
+                            if self_distillation_cfg.full_logit_distillation
+                            else None
+                        )
                     # all return: (bsz, response_length)
-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -841,11 +1024,17 @@ class DataParallelPPOActor(BasePPOActor):
                             student_topk_log_probs=student_topk_logps,
                             teacher_topk_log_probs=teacher_topk_logps,
                             self_distillation_mask=self_distillation_mask,
+                            self_distillation_weight=self_distillation_weight,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
                         )
-
-                        pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        pg_metrics.update(sparse_metrics)
+                        effective_target = (
+                            self_distillation_weight
+                            if self_distillation_weight is not None
+                            else self_distillation_mask
+                        )
+                        pg_metrics["self_distillation/empty_target_batch"] = float(effective_target.sum().item() == 0)
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
@@ -906,16 +1095,43 @@ class DataParallelPPOActor(BasePPOActor):
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    mini_batch_did_backward = True
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                if torch.isfinite(grad_norm).item():
-                    did_update = True
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if mini_batch_did_backward:
+                    grad_norm = self._optimizer_step()
+                    if torch.isfinite(grad_norm).item():
+                        did_update = True
+                    grad_norm_value = grad_norm.detach().item()
+                else:
+                    grad_norm_value = 0.0
+                mini_batch_metrics = {"actor/grad_norm": grad_norm_value}
+                if self_distillation_enabled:
+                    mini_batch_metrics["self_distillation/sparse_skipped_optimizer_step"] = float(
+                        not mini_batch_did_backward
+                    )
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         if did_update:
-            self._update_teacher()
+            teacher_update_start = time.perf_counter()
+            updated_tensors, updated_elements = self._update_teacher()
+            append_to_dict(
+                metrics,
+                {
+                    "self_distillation/ema_updated_parameter_tensors": updated_tensors,
+                    "self_distillation/ema_updated_parameter_elements": updated_elements,
+                    "timing_s/ema_teacher_update": time.perf_counter() - teacher_update_start,
+                },
+            )
+        elif self_distillation_enabled:
+            append_to_dict(
+                metrics,
+                {
+                    "self_distillation/ema_updated_parameter_tensors": 0,
+                    "self_distillation/ema_updated_parameter_elements": 0,
+                    "timing_s/ema_teacher_update": 0.0,
+                },
+            )
         return metrics
